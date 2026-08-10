@@ -11,7 +11,7 @@ export type { InboundMessageHandler, RegisterAdapterOptions } from './ChannelRou
 export { evaluateGroupPolicy } from './group-policy.js';
 export type { GroupPolicyInput, GroupPolicyResult, GroupPolicyReason } from './group-policy.js';
 
-// Phase 4: Adapter implementations — base class + 14 platform adapters
+// Phase 4: Adapter implementations — base class + 13 platform adapters
 export { BaseChannelAdapter } from './adapters/BaseChannelAdapter.js';
 export type { RetryConfig } from './adapters/BaseChannelAdapter.js';
 

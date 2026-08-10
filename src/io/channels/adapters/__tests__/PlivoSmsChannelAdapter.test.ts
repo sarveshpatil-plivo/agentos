@@ -12,6 +12,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   PlivoSmsChannelAdapter,
   computePlivoV3Signature,
+  computePlivoV2Signature,
 } from '../PlivoSmsChannelAdapter.js';
 import type { ChannelEvent } from '../../types.js';
 
@@ -51,6 +52,18 @@ describe('computePlivoV3Signature', () => {
       To: '+14150000002',
     };
     expect(computePlivoV3Signature({ ...FIXTURE, params: shuffled })).toBe(SIG_EXPECTED);
+  });
+});
+
+// V2 family (X-Plivo-Signature-MA-V2 / -V2): URL + nonce only, no params.
+const SIG_V2_NONCE = 'v2nonce123';
+const SIG_V2_EXPECTED = '11SrlUsMnaVucWWYpH2WykVm2JxMFLOQfuRZxoH0Qf0=';
+
+describe('computePlivoV2Signature', () => {
+  it('reproduces the V2 (url + nonce) HMAC golden value', () => {
+    expect(
+      computePlivoV2Signature({ url: FIXTURE.url, nonce: SIG_V2_NONCE, authToken: FIXTURE.authToken }),
+    ).toBe(SIG_V2_EXPECTED);
   });
 });
 
@@ -168,6 +181,44 @@ describe('PlivoSmsChannelAdapter — inbound', () => {
       headers: {
         'x-plivo-signature-v3': [SIG_EXPECTED],
         'x-plivo-signature-v3-nonce': [FIXTURE.nonce],
+      },
+    });
+
+    expect(events).toHaveLength(1);
+  });
+
+  it('accepts the inbound-messaging MA-V3 header (the real wire header for SMS)', async () => {
+    const adapter = new PlivoSmsChannelAdapter({ fetchImpl: makeFetch({}) });
+    await connect(adapter);
+
+    const events: ChannelEvent[] = [];
+    adapter.on((e) => void events.push(e), ['message']);
+
+    adapter.handleIncomingWebhook(inboundBody, {
+      method: 'POST',
+      url: FIXTURE.url,
+      headers: {
+        'x-plivo-signature-ma-v3': SIG_EXPECTED,
+        'x-plivo-signature-v3-nonce': FIXTURE.nonce,
+      },
+    });
+
+    expect(events).toHaveLength(1);
+  });
+
+  it('accepts the V2 family (MA-V2 header + V2 nonce)', async () => {
+    const adapter = new PlivoSmsChannelAdapter({ fetchImpl: makeFetch({}) });
+    await connect(adapter);
+
+    const events: ChannelEvent[] = [];
+    adapter.on((e) => void events.push(e), ['message']);
+
+    adapter.handleIncomingWebhook(inboundBody, {
+      method: 'POST',
+      url: FIXTURE.url,
+      headers: {
+        'x-plivo-signature-ma-v2': SIG_V2_EXPECTED,
+        'x-plivo-signature-v2-nonce': SIG_V2_NONCE,
       },
     });
 

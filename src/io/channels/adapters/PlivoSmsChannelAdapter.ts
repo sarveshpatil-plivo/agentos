@@ -7,7 +7,9 @@
  *    HTTP Basic auth (Auth ID / Auth Token).
  * 2. **Inbound** — Plivo POSTs incoming messages to a configured message URL.
  *    The host application forwards the request to {@link handleIncomingWebhook},
- *    which verifies the `X-Plivo-Signature-V3` signature before emitting.
+ *    which verifies Plivo's inbound-message signature before emitting. Inbound
+ *    messaging is signed under `X-Plivo-Signature-MA-V3`; the plain V3 and the
+ *    V2 family are accepted as well.
  *
  * The adapter does NOT start its own HTTP server; the host wires a route
  * (Express/Fastify/etc.) that forwards inbound requests here — the same
@@ -118,7 +120,7 @@ export class PlivoSmsChannelAdapter extends BaseChannelAdapter<PlivoSmsAuthParam
     try {
       const resp = await this.fetchImpl(
         `https://api.plivo.com/v1/Account/${this.authId}/`,
-        { headers: { Authorization: this.authHeader } },
+        { headers: { Authorization: this.authHeader }, signal: AbortSignal.timeout(10_000) },
       );
       if (resp.ok) {
         const data = (await resp.json()) as Record<string, unknown>;
@@ -178,6 +180,7 @@ export class PlivoSmsChannelAdapter extends BaseChannelAdapter<PlivoSmsAuthParam
           text,
           type: 'sms',
         }),
+        signal: AbortSignal.timeout(10_000),
       },
     );
 
@@ -264,16 +267,26 @@ export class PlivoSmsChannelAdapter extends BaseChannelAdapter<PlivoSmsAuthParam
   // ── Private: signature verification ──
 
   /**
-   * Verify an inbound request carries a valid Plivo X-Plivo-Signature-V3.
-   * Fails closed: missing headers/URL/token → not from Plivo.
+   * Verify an inbound request genuinely came from Plivo.
+   *
+   * Plivo sends more than one signature header and the one that matches depends
+   * on the channel. Inbound messaging (SMS) is signed under
+   * `X-Plivo-Signature-MA-V3`, while voice callbacks use the plain
+   * `X-Plivo-Signature-V3`; Plivo's public docs also still document the older V2
+   * scheme (`X-Plivo-Signature-MA-V2` / `X-Plivo-Signature-V2`). To be robust we
+   * accept the request if ANY family validates: the V3 family (body params folded
+   * into the signed string, keyed on `X-Plivo-Signature-V3-Nonce`) or the V2
+   * family (URL + nonce only, keyed on `X-Plivo-Signature-V2-Nonce`). Every
+   * candidate must still match cryptographically, so accepting several families
+   * cannot produce a false accept.
+   *
+   * Fails closed: missing URL/token, or no family matches → not from Plivo.
    */
   private isFromPlivo(
     body: Record<string, unknown>,
     meta?: { method?: string; url?: string; headers?: Record<string, string | string[] | undefined> },
   ): boolean {
     const headers = meta?.headers ?? {};
-    const signature = headerValue(headers, 'x-plivo-signature-v3');
-    const nonce = headerValue(headers, 'x-plivo-signature-v3-nonce');
     const url = meta?.url ?? this.webhookUrl;
     const method = (meta?.method ?? 'POST').toUpperCase();
 
@@ -284,20 +297,41 @@ export class PlivoSmsChannelAdapter extends BaseChannelAdapter<PlivoSmsAuthParam
       );
       return false;
     }
-    if (!signature || !nonce || !this.authToken) return false;
+    if (!this.authToken) return false;
 
-    let expected: string;
-    try {
-      expected = computePlivoV3Signature({ method, url, nonce, authToken: this.authToken, params: body });
-    } catch {
-      return false; // malformed URL/input is untrusted, not a crash
+    // V3 family: MA-V3 for inbound messaging, plain V3 for voice. Params folded
+    // into the signed string, keyed on the V3 nonce.
+    const v3 = joinHeaders(headers, ['x-plivo-signature-ma-v3', 'x-plivo-signature-v3']);
+    const v3Nonce = headerValue(headers, 'x-plivo-signature-v3-nonce');
+    if (v3 && v3Nonce) {
+      try {
+        const expected = computePlivoV3Signature({
+          method,
+          url,
+          nonce: v3Nonce,
+          authToken: this.authToken,
+          params: body,
+        });
+        if (signatureMatches(v3, expected)) return true;
+      } catch {
+        // malformed URL/input for V3 → fall through to the V2 family
+      }
     }
 
-    const expectedBuf = Buffer.from(expected);
-    return signature.split(',').some((candidate) => {
-      const candBuf = Buffer.from(candidate.trim());
-      return candBuf.length === expectedBuf.length && timingSafeEqual(candBuf, expectedBuf);
-    });
+    // V2 family: MA-V2 for messaging, plain V2 for voice. URL + nonce only (no
+    // params), keyed on the V2 nonce.
+    const v2 = joinHeaders(headers, ['x-plivo-signature-ma-v2', 'x-plivo-signature-v2']);
+    const v2Nonce = headerValue(headers, 'x-plivo-signature-v2-nonce');
+    if (v2 && v2Nonce) {
+      try {
+        const expected = computePlivoV2Signature({ url, nonce: v2Nonce, authToken: this.authToken });
+        if (signatureMatches(v2, expected)) return true;
+      } catch {
+        // malformed input → no family matched
+      }
+    }
+
+    return false;
   }
 }
 
@@ -346,6 +380,23 @@ export function computePlivoV3Signature(input: {
   return createHmac('sha256', authToken).update(signed).digest('base64');
 }
 
+/**
+ * Compute Plivo's V2-family signature (`X-Plivo-Signature-MA-V2` for messaging,
+ * `X-Plivo-Signature-V2` for voice). Unlike V3 it folds in no params: strip the
+ * query off the URL, append the V2 nonce, HMAC-SHA256 with the auth token, then
+ * base64. Matches `plivo-python`'s `validate_signature`.
+ */
+export function computePlivoV2Signature(input: {
+  url: string;
+  nonce: string;
+  authToken: string;
+}): string {
+  const { url, nonce, authToken } = input;
+  const parsed = new URL(url);
+  const base = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  return createHmac('sha256', authToken).update(base + nonce).digest('base64');
+}
+
 /** Sorted, separator-less `key`+`value` concatenation (recurses dicts, sorts lists). */
 function sortedParamsString(params: Record<string, unknown>): string {
   let out = '';
@@ -374,6 +425,26 @@ function headerValue(
     if (Array.isArray(v) && typeof v[0] === 'string') return v[0];
   }
   return undefined;
+}
+
+/** Comma-join the present values of several signature headers into one candidate list. */
+function joinHeaders(
+  headers: Record<string, string | string[] | undefined>,
+  names: string[],
+): string {
+  return names
+    .map((n) => headerValue(headers, n))
+    .filter((v): v is string => !!v)
+    .join(',');
+}
+
+/** Constant-time check that `expected` equals any of the comma-separated candidates. */
+function signatureMatches(candidates: string, expected: string): boolean {
+  const expectedBuf = Buffer.from(expected);
+  return candidates.split(',').some((candidate) => {
+    const candBuf = Buffer.from(candidate.trim());
+    return candBuf.length === expectedBuf.length && timingSafeEqual(candBuf, expectedBuf);
+  });
 }
 
 // ============================================================================
